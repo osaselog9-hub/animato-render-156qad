@@ -1,0 +1,115 @@
+# animato-render-pipeline v5
+# Made by Animato Stickman Studio. Builds the video for one job (a branch called job-<id>) and saves the encrypted video as an artifact
+# that is kept for one day. Nothing here runs unless the app starts it for a real job: there is no schedule and no retry.
+# Short on purpose: one checkout (the job branch already holds the tools and the engine), the tools are cached, no extra "plan" job.
+name: render
+run-name: render ${{ inputs.job }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      job:
+        description: Job id made by the app
+        required: true
+      key:
+        description: Key that unlocks this job (made by the app)
+        required: true
+      parts:
+        description: Part numbers made by the app, like [0,1,2]
+        required: true
+        default: '[0]'
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: render
+  cancel-in-progress: false
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: true
+      max-parallel: 12
+      matrix:
+        part: ${{ fromJson(inputs.parts) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: job-${{ inputs.job }}
+      - name: Saved tools
+        id: deps
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: render-tools-v5-${{ hashFiles('package.json') }}
+      - name: Install the tools (first time only)
+        if: steps.deps.outputs.cache-hit != 'true'
+        run: npm install --no-audit --no-fund --loglevel=error
+      - name: Check the limits
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          node tools/plan.mjs job/meta.json ${{ matrix.part }}
+          if [ "${{ matrix.part }}" = "0" ]; then
+            SINCE=$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ)
+            N=$(gh api "repos/${{ github.repository }}/actions/workflows/render.yml/runs?created=%3E%3D$SINCE&per_page=1" --jq '.total_count')
+            echo "runs in the last 24 hours: $N"
+            if [ "$N" -gt 10 ]; then echo "Daily limit reached"; exit 1; fi
+          fi
+      - name: Unpack the engine
+        run: if [ -f app.zip ]; then unzip -q -o app.zip -d app; fi
+      - name: Draw part ${{ matrix.part }}
+        env:
+          CHROME_PATH: /usr/bin/google-chrome
+          KEY: ${{ inputs.key }}
+        run: node tools/render.mjs job out ${{ matrix.part }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: part-${{ matrix.part }}-${{ inputs.job }}
+          path: out/part-${{ matrix.part }}.enc
+          retention-days: 1
+          compression-level: 0
+
+  join:
+    needs: render
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: job-${{ inputs.job }}
+      - name: Saved tools
+        id: deps
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: render-tools-v5-${{ hashFiles('package.json') }}
+      - name: Install the tools (first time only)
+        if: steps.deps.outputs.cache-hit != 'true'
+        run: npm install --no-audit --no-fund --loglevel=error
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: part-*-${{ inputs.job }}
+          path: parts
+          merge-multiple: true
+      - name: Join and add the voiceover
+        env:
+          KEY: ${{ inputs.key }}
+        run: node tools/join.mjs job parts final
+      - uses: actions/upload-artifact@v4
+        with:
+          name: video-${{ inputs.job }}
+          path: final/video.enc
+          retention-days: 1
+          compression-level: 0
+      - name: Remove the part files
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for id in $(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts" --jq '.artifacts[] | select(.name | startswith("part-")) | .id'); do
+            gh api -X DELETE "repos/${{ github.repository }}/actions/artifacts/$id" || true
+          done
